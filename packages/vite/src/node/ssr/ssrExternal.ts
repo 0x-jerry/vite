@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
-import type { InternalResolveOptions } from '../plugins/resolve'
+import type { InternalResolveOptions, ResolveOptions } from '../plugins/resolve'
 import { tryNodeResolve } from '../plugins/resolve'
 import {
   bareImportRE,
@@ -9,11 +9,12 @@ import {
   createFilter,
   isBuiltin,
   isDefined,
+  isInNodeModules,
   lookupFile,
   normalizePath,
-  resolveFrom
 } from '../utils'
 import type { Logger, ResolvedConfig } from '..'
+import { resolvePackageData } from '../packages'
 
 const debug = createDebugger('vite:ssr-external')
 
@@ -33,7 +34,7 @@ export function stripNesting(packages: string[]): string[] {
  */
 export function cjsSsrResolveExternals(
   config: ResolvedConfig,
-  knownImports: string[]
+  knownImports: string[],
 ): string[] {
   // strip nesting since knownImports may be passed in from optimizeDeps which
   // supports a "parent > child" syntax
@@ -53,10 +54,10 @@ export function cjsSsrResolveExternals(
 
   cjsSsrCollectExternals(
     config.root,
-    config.resolve.preserveSymlinks,
+    config.resolve,
     ssrExternals,
     seen,
-    config.logger
+    config.logger,
   )
 
   const importedDeps = knownImports.map(getNpmPackageName).filter(isDefined)
@@ -76,14 +77,14 @@ export function cjsSsrResolveExternals(
   let externals = [...ssrExternals]
   if (ssrConfig?.noExternal) {
     externals = externals.filter(
-      createFilter(undefined, ssrConfig.noExternal, { resolve: false })
+      createFilter(undefined, ssrConfig.noExternal, { resolve: false }),
     )
   }
   return externals
 }
 
 const CJS_CONTENT_RE =
-  /\bmodule\.exports\b|\bexports[.\[]|\brequire\s*\(|\bObject\.(defineProperty|defineProperties|assign)\s*\(\s*exports\b/
+  /\bmodule\.exports\b|\bexports[.[]|\brequire\s*\(|\bObject\.(?:defineProperty|defineProperties|assign)\s*\(\s*exports\b/
 
 // TODO: use import()
 const _require = createRequire(import.meta.url)
@@ -95,7 +96,7 @@ const isSsrExternalCache = new WeakMap<
 
 export function shouldExternalizeForSSR(
   id: string,
-  config: ResolvedConfig
+  config: ResolvedConfig,
 ): boolean | undefined {
   let isSsrExternal = isSsrExternalCache.get(config)
   if (!isSsrExternal) {
@@ -106,7 +107,7 @@ export function shouldExternalizeForSSR(
 }
 
 export function createIsConfiguredAsSsrExternal(
-  config: ResolvedConfig
+  config: ResolvedConfig,
 ): (id: string) => boolean {
   const { ssr, root } = config
   const noExternal = ssr?.noExternal
@@ -116,15 +117,15 @@ export function createIsConfiguredAsSsrExternal(
     createFilter(undefined, noExternal, { resolve: false })
 
   const resolveOptions: InternalResolveOptions = {
+    ...config.resolve,
     root,
-    preserveSymlinks: config.resolve.preserveSymlinks,
     isProduction: false,
-    isBuild: true
+    isBuild: true,
   }
 
   const isExternalizable = (
     id: string,
-    configuredAsExternal?: boolean
+    configuredAsExternal?: boolean,
   ): boolean => {
     if (!bareImportRE.test(id) || id.includes('\0')) {
       return false
@@ -142,11 +143,11 @@ export function createIsConfiguredAsSsrExternal(
         true,
         // Allow linked packages to be externalized if they are explicitly
         // configured as external
-        !!configuredAsExternal
+        !!configuredAsExternal,
       )?.external
     } catch (e) {
-      debug(
-        `Failed to node resolve "${id}". Skipping externalizing it by default.`
+      debug?.(
+        `Failed to node resolve "${id}". Skipping externalizing it by default.`,
       )
       // may be an invalid import that's resolved by a plugin
       return false
@@ -188,7 +189,7 @@ export function createIsConfiguredAsSsrExternal(
 }
 
 function createIsSsrExternal(
-  config: ResolvedConfig
+  config: ResolvedConfig,
 ): (id: string) => boolean | undefined {
   const processedIds = new Map<string, boolean | undefined>()
 
@@ -199,7 +200,7 @@ function createIsSsrExternal(
       return processedIds.get(id)
     }
     let external = false
-    if (!id.startsWith('.') && !path.isAbsolute(id)) {
+    if (id[0] !== '.' && !path.isAbsolute(id)) {
       external = isBuiltin(id) || isConfiguredAsExternal(id)
     }
     processedIds.set(id, external)
@@ -211,12 +212,16 @@ function createIsSsrExternal(
 // is used reverting to the Vite 2.9 SSR externalization heuristics
 function cjsSsrCollectExternals(
   root: string,
-  preserveSymlinks: boolean | undefined,
+  resolveOptions: Required<ResolveOptions>,
   ssrExternals: Set<string>,
   seen: Set<string>,
-  logger: Logger
+  logger: Logger,
 ) {
-  const rootPkgContent = lookupFile(root, ['package.json'])
+  const rootPkgPath = lookupFile(root, ['package.json'])
+  if (!rootPkgPath) {
+    return
+  }
+  const rootPkgContent = fs.readFileSync(rootPkgPath, 'utf-8')
   if (!rootPkgContent) {
     return
   }
@@ -224,14 +229,14 @@ function cjsSsrCollectExternals(
   const rootPkg = JSON.parse(rootPkgContent)
   const deps = {
     ...rootPkg.devDependencies,
-    ...rootPkg.dependencies
+    ...rootPkg.dependencies,
   }
 
-  const resolveOptions: InternalResolveOptions = {
+  const internalResolveOptions: InternalResolveOptions = {
+    ...resolveOptions,
     root,
-    preserveSymlinks,
     isProduction: false,
-    isBuild: true
+    isBuild: true,
   }
 
   const depsToTrace = new Set<string>()
@@ -247,28 +252,28 @@ function cjsSsrCollectExternals(
       esmEntry = tryNodeResolve(
         id,
         undefined,
-        resolveOptions,
+        internalResolveOptions,
         true, // we set `targetWeb` to `true` to get the ESM entry
         undefined,
-        true
+        true,
       )?.id
       // normalizePath required for windows. tryNodeResolve uses normalizePath
       // which returns with '/', require.resolve returns with '\\'
       requireEntry = normalizePath(_require.resolve(id, { paths: [root] }))
     } catch (e) {
-      try {
-        // no main entry, but deep imports may be allowed
-        const pkgPath = resolveFrom(`${id}/package.json`, root)
-        if (pkgPath.includes('node_modules')) {
+      // no main entry, but deep imports may be allowed
+      const pkgDir = resolvePackageData(id, root)?.dir
+      if (pkgDir) {
+        if (isInNodeModules(pkgDir)) {
           ssrExternals.add(id)
         } else {
-          depsToTrace.add(path.dirname(pkgPath))
+          depsToTrace.add(path.dirname(pkgDir))
         }
         continue
-      } catch {}
+      }
 
       // resolve failed, assume include
-      debug(`Failed to resolve entries for package "${id}"\n`, e)
+      debug?.(`Failed to resolve entries for package "${id}"\n`, e)
       continue
     }
     // no esm entry but has require entry
@@ -276,9 +281,11 @@ function cjsSsrCollectExternals(
       ssrExternals.add(id)
     }
     // trace the dependencies of linked packages
-    else if (!esmEntry.includes('node_modules')) {
-      const pkgPath = resolveFrom(`${id}/package.json`, root)
-      depsToTrace.add(path.dirname(pkgPath))
+    else if (!isInNodeModules(esmEntry)) {
+      const pkgDir = resolvePackageData(id, root)?.dir
+      if (pkgDir) {
+        depsToTrace.add(pkgDir)
+      }
     }
     // has separate esm/require entry, assume require entry is cjs
     else if (esmEntry !== requireEntry) {
@@ -288,13 +295,10 @@ function cjsSsrCollectExternals(
     // or are there others like SystemJS / AMD that we'd need to handle?
     // for now, we'll just leave this as is
     else if (/\.m?js$/.test(esmEntry)) {
-      const pkgPath = resolveFrom(`${id}/package.json`, root)
-      const pkgContent = fs.readFileSync(pkgPath, 'utf-8')
-
-      if (!pkgContent) {
+      const pkg = resolvePackageData(id, root)?.data
+      if (!pkg) {
         continue
       }
-      const pkg = JSON.parse(pkgContent)
 
       if (pkg.type === 'module' || esmEntry.endsWith('.mjs')) {
         ssrExternals.add(id)
@@ -308,25 +312,19 @@ function cjsSsrCollectExternals(
       }
 
       logger.warn(
-        `${id} doesn't appear to be written in CJS, but also doesn't appear to be a valid ES module (i.e. it doesn't have "type": "module" or an .mjs extension for the entry point). Please contact the package author to fix.`
+        `${id} doesn't appear to be written in CJS, but also doesn't appear to be a valid ES module (i.e. it doesn't have "type": "module" or an .mjs extension for the entry point). Please contact the package author to fix.`,
       )
     }
   }
 
   for (const depRoot of depsToTrace) {
-    cjsSsrCollectExternals(
-      depRoot,
-      preserveSymlinks,
-      ssrExternals,
-      seen,
-      logger
-    )
+    cjsSsrCollectExternals(depRoot, resolveOptions, ssrExternals, seen, logger)
   }
 }
 
 export function cjsShouldExternalizeForSSR(
   id: string,
-  externals: string[] | null
+  externals: string[] | null,
 ): boolean {
   if (!externals) {
     return false
@@ -346,7 +344,7 @@ export function cjsShouldExternalizeForSSR(
 
 function getNpmPackageName(importPath: string): string | null {
   const parts = importPath.split('/')
-  if (parts[0].startsWith('@')) {
+  if (parts[0][0] === '@') {
     if (!parts[1]) return null
     return `${parts[0]}/${parts[1]}`
   } else {

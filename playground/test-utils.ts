@@ -18,26 +18,29 @@ export * from './vitestSetup'
 export const ports = {
   cli: 9510,
   'cli-module': 9511,
+  json: 9512,
   'legacy/ssr': 9520,
   lib: 9521,
   'optimize-missing-deps': 9522,
   'legacy/client-and-ssr': 9523,
-  'ssr-deps': 9600,
-  'ssr-html': 9601,
-  'ssr-pug': 9602,
-  'ssr-react': 9603,
-  'ssr-vue': 9604,
+  'assets/url-base': 9524, // not imported but used in `assets/vite.config-url-base.js`
+  ssr: 9600,
+  'ssr-deps': 9601,
+  'ssr-html': 9602,
+  'ssr-noexternal': 9603,
+  'ssr-pug': 9604,
   'ssr-webworker': 9605,
   'css/postcss-caching': 5005,
-  'css/postcss-plugins-different-dir': 5006
+  'css/postcss-plugins-different-dir': 5006,
+  'css/dynamic-import': 5007,
 }
 export const hmrPorts = {
   'optimize-missing-deps': 24680,
-  'ssr-deps': 24681,
-  'ssr-html': 24682,
-  'ssr-pug': 24683,
-  'ssr-react': 24684,
-  'ssr-vue': 24685
+  ssr: 24681,
+  'ssr-deps': 24682,
+  'ssr-html': 24683,
+  'ssr-noexternal': 24684,
+  'ssr-pug': 24685,
 }
 
 const hexToNameMap: Record<string, string> = {}
@@ -69,7 +72,11 @@ const timeout = (n: number) => new Promise((r) => setTimeout(r, n))
 
 async function toEl(el: string | ElementHandle): Promise<ElementHandle> {
   if (typeof el === 'string') {
-    return await page.$(el)
+    const realEl = await page.$(el)
+    if (realEl == null) {
+      throw new Error(`Cannot find element: "${el}"`)
+    }
+    return realEl
   }
   return el
 }
@@ -97,7 +104,7 @@ export function readFile(filename: string): string {
 export function editFile(
   filename: string,
   replacer: (str: string) => string,
-  runInBuild: boolean = false
+  runInBuild: boolean = false,
 ): void {
   if (isBuild && !runInBuild) return
   filename = path.resolve(testDir, filename)
@@ -122,7 +129,7 @@ export function listAssets(base = ''): string[] {
 export function findAssetFile(
   match: string | RegExp,
   base = '',
-  assets = 'assets'
+  assets = 'assets',
 ): string {
   const assetsDir = path.join(testDir, 'dist', base, assets)
   let files: string[]
@@ -142,7 +149,7 @@ export function findAssetFile(
 
 export function readManifest(base = ''): Manifest {
   return JSON.parse(
-    fs.readFileSync(path.join(testDir, 'dist', base, 'manifest.json'), 'utf-8')
+    fs.readFileSync(path.join(testDir, 'dist', base, 'manifest.json'), 'utf-8'),
   )
 }
 
@@ -151,14 +158,19 @@ export function readManifest(base = ''): Manifest {
  */
 export async function untilUpdated(
   poll: () => string | Promise<string>,
-  expected: string,
-  runInBuild = false
+  expected: string | RegExp,
+  runInBuild = false,
 ): Promise<void> {
   if (isBuild && !runInBuild) return
   const maxTries = process.env.CI ? 200 : 50
   for (let tries = 0; tries < maxTries; tries++) {
     const actual = (await poll()) ?? ''
-    if (actual.indexOf(expected) > -1 || tries === maxTries - 1) {
+    if (
+      (typeof expected === 'string'
+        ? actual.indexOf(expected) > -1
+        : actual.match(expected)) ||
+      tries === maxTries - 1
+    ) {
       expect(actual).toMatch(expected)
       break
     } else {
@@ -172,7 +184,7 @@ export async function untilUpdated(
  */
 export async function withRetry(
   func: () => Promise<void>,
-  runInBuild = false
+  runInBuild = false,
 ): Promise<void> {
   if (isBuild && !runInBuild) return
   const maxTries = process.env.CI ? 200 : 50
@@ -186,12 +198,29 @@ export async function withRetry(
   await func()
 }
 
+type UntilBrowserLogAfterCallback = (logs: string[]) => PromiseLike<void> | void
+
 export async function untilBrowserLogAfter(
   operation: () => any,
   target: string | RegExp | Array<string | RegExp>,
-  callback?: (logs: string[]) => PromiseLike<void> | void
+  expectOrder?: boolean,
+  callback?: UntilBrowserLogAfterCallback,
+): Promise<string[]>
+export async function untilBrowserLogAfter(
+  operation: () => any,
+  target: string | RegExp | Array<string | RegExp>,
+  callback?: UntilBrowserLogAfterCallback,
+): Promise<string[]>
+export async function untilBrowserLogAfter(
+  operation: () => any,
+  target: string | RegExp | Array<string | RegExp>,
+  arg3?: boolean | UntilBrowserLogAfterCallback,
+  arg4?: UntilBrowserLogAfterCallback,
 ): Promise<string[]> {
-  const promise = untilBrowserLog(target, false)
+  const expectOrder = typeof arg3 === 'boolean' ? arg3 : false
+  const callback = typeof arg3 === 'boolean' ? arg4 : arg3
+
+  const promise = untilBrowserLog(target, expectOrder)
   await operation()
   const logs = await promise
   if (callback) {
@@ -202,7 +231,7 @@ export async function untilBrowserLogAfter(
 
 async function untilBrowserLog(
   target?: string | RegExp | Array<string | RegExp>,
-  expectOrder = true
+  expectOrder = true,
 ): Promise<string[]> {
   let resolve: () => void
   let reject: (reason: any) => void
@@ -233,7 +262,7 @@ async function untilBrowserLog(
         const remainingMatchers = target.map(isMatch)
         processMsg = (text: string) => {
           const nextIndex = remainingMatchers.findIndex((matcher) =>
-            matcher(text)
+            matcher(text),
           )
           if (nextIndex >= 0) {
             remainingMatchers.splice(nextIndex, 1)
@@ -284,7 +313,7 @@ export const formatSourcemapForSnapshot = (map: any): any => {
 
 // helper function to kill process, uses taskkill on windows to ensure child process is killed too
 export async function killProcess(
-  serverProcess: ExecaChildProcess
+  serverProcess: ExecaChildProcess,
 ): Promise<void> {
   if (isWindows) {
     try {

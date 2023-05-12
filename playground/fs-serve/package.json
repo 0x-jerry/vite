@@ -1,7 +1,8 @@
 {
-  "name": "test-fs-serve",
+  "name": "@vitejs/test-fs-serve",
   "private": true,
   "version": "0.0.0",
+  "type": "module",
   "scripts": {
     "dev": "vite root",
     "build": "vite build root",
