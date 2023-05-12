@@ -86,6 +86,12 @@ declare module 'vite' {
       baseRoute: string
     }
   }
+
+  interface UserConfig {
+    testConfig?: {
+      baseRoute: string
+    }
+  }
 }
 
 export function setViteUrl(url: string): void {
@@ -306,7 +312,7 @@ export async function notifyRebuildComplete(
   return watcher.off('event', callback)
 }
 
-function createInMemoryLogger(logs: string[]): Logger {
+export function createInMemoryLogger(logs: string[]): Logger {
   const loggedErrors = new WeakSet<Error | RollupError>()
   const warnedMessages = new Set<string>()
 

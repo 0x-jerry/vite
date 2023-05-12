@@ -5,11 +5,13 @@ import type { Plugin } from '../plugin'
 import type { ResolvedConfig } from '../config'
 import type { ResolveFn } from '../'
 import {
+  injectQuery,
   isParentDirectory,
   normalizePath,
   slash,
   transformStableResult,
 } from '../utils'
+import { CLIENT_ENTRY } from '../constants'
 import { fileToUrl } from './asset'
 import { preloadHelperId } from './importAnalysisBuild'
 
@@ -33,6 +35,7 @@ export function assetImportMetaUrlPlugin(config: ResolvedConfig): Plugin {
       if (
         !options?.ssr &&
         id !== preloadHelperId &&
+        id !== CLIENT_ENTRY &&
         code.includes('new URL') &&
         code.includes(`import.meta.url`)
       ) {
@@ -52,11 +55,28 @@ export function assetImportMetaUrlPlugin(config: ResolvedConfig): Plugin {
           if (!s) s = new MagicString(code)
 
           // potential dynamic template string
-          if (rawUrl[0] === '`' && /\$\{/.test(rawUrl)) {
-            const ast = this.parse(rawUrl)
+          if (rawUrl[0] === '`' && rawUrl.includes('${')) {
+            let [pureUrl, queryString = ''] = rawUrl.split('?')
+            if (queryString) {
+              pureUrl += '`'
+              queryString = '?' + queryString.slice(0, -1)
+            }
+            const ast = this.parse(pureUrl)
             const templateLiteral = (ast as any).body[0].expression
             if (templateLiteral.expressions.length) {
-              const pattern = JSON.stringify(buildGlobPattern(templateLiteral))
+              const pattern = buildGlobPattern(templateLiteral)
+              if (pattern.startsWith('**')) {
+                // don't transform for patterns like this
+                // because users won't intend to do that in most cases
+                continue
+              }
+
+              const globOptions = {
+                eager: true,
+                import: 'default',
+                // A hack to allow 'as' & 'query' exist at the same time
+                query: injectQuery(queryString, 'url'),
+              }
               // Note: native import.meta.url is not supported in the baseline
               // target so we use the global location here. It can be
               // window.location or self.location in case it is used in a Web Worker.
@@ -64,7 +84,11 @@ export function assetImportMetaUrlPlugin(config: ResolvedConfig): Plugin {
               s.update(
                 index,
                 index + exp.length,
-                `new URL((import.meta.glob(${pattern}, { eager: true, import: 'default', as: 'url' }))[${rawUrl}], self.location)`,
+                `new URL((import.meta.glob(${JSON.stringify(
+                  pattern,
+                )}, ${JSON.stringify(
+                  globOptions,
+                )}))[${pureUrl}], self.location)`,
               )
               continue
             }
@@ -72,7 +96,7 @@ export function assetImportMetaUrlPlugin(config: ResolvedConfig): Plugin {
 
           const url = rawUrl.slice(1, -1)
           let file: string | undefined
-          if (url.startsWith('.')) {
+          if (url[0] === '.') {
             file = slash(path.resolve(path.dirname(id), url))
           } else {
             assetResolver ??= config.createResolver({
